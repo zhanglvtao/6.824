@@ -14,54 +14,54 @@ import "strconv"
 //
 
 type ExampleArgs struct {
-	X int
+  X int
 }
 
 type ExampleReply struct {
-	Y int
+  Y int
 }
 // Add your RPC definitions here.
 type RegisterArgs struct{}
 
 type RegisterReply struct {
-	ExecutorId ExecutorId
+  ExecutorId ExecutorId
 }
 type HeartbeatArgs struct {
-	ExecutorId ExecutorId
+  ExecutorId ExecutorId
 }
 
 type HeartbeatAction string
 const (
-	HeartbeatActionExit HeartbeatAction = "HeartbeatActionExit"
-	HeartbeatActionNoAction HeartbeatAction = "HeartbeatActionNoAction"
+  HeartbeatActionExit HeartbeatAction = "HeartbeatActionExit"
+  HeartbeatActionNoAction HeartbeatAction = "HeartbeatActionNoAction"
 )
 type HeartbeatReply struct {
-	Ok bool
-	Action HeartbeatAction
+  Ok bool
+  Action HeartbeatAction
 }
 
 type FetchTaskArgs struct {
-	ExecutorId ExecutorId
+  ExecutorId ExecutorId
 }
 
 type FetchTaskReply struct {
-	Task Task
+  Task Task
 }
 
 type UpdateTaskArgs struct {
-	ExecutorId ExecutorId
-	Task Task
+  ExecutorId ExecutorId
+  Task Task
 }
 
 type UpdateTaskReply struct {
-	Task Task
+  Task Task
 }
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
 // Can't use the current directory since
 // Athena AFS doesn't support UNIX-domain sockets.
 func coordinatorSock() string {
-	s := "/var/tmp/824-mr-"
-	s += strconv.Itoa(os.Getuid())
-	return s
+  s := "/var/tmp/824-mr-"
+  s += strconv.Itoa(os.Getuid())
+  return s
 }

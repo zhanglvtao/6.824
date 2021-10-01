@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -13,16 +14,16 @@ import (
 )
 type JobStage string
 const (
-  JobStageMap 		JobStage = "Map"
-  JobStageReduce 	JobStage = "Reduce" 
+  JobStageMap     JobStage = "Map"
+  JobStageReduce  JobStage = "Reduce"
   JobStageFinish  JobStage = "Finish"
 )
 type Coordinator struct {
   // Your definitions here.
-  stage								JobStage
-  eMutex							*sync.Mutex
-  executors						map[ExecutorId]*Executor
-  taskManager   			*TaskManager
+  stage               JobStage
+  eMutex              *sync.Mutex
+  executors           map[ExecutorId]*Executor
+  taskManager         *TaskManager
   executorIdCount     *uint64
   nReduce             uint64
 }
@@ -44,7 +45,7 @@ func (c *Coordinator) executorCheck() {
         log.Printf("Executor-%d Dead ☠️ . Due Now/LUT (%v/%v)", executorId, now, executor.lastHeartbeatTime)
         go c.taskManager.ReSchedule(executor.taskId)
       }
-    }   
+    }
     c.eMutex.Unlock()
     log.Println("<==== Finish Executor Check")
     time.Sleep(5 * time.Second)
@@ -62,8 +63,8 @@ func (c *Coordinator) stageCheck() {
       log.Println("Stage: Map => Reduce")
       // Generate Reduce Task
       for i := 0; i < int(c.nReduce); i++ {
-        shuffle := "shuffle-" + strconv.Itoa(i)
-        reduce := "mr-out-" + strconv.Itoa(i)
+				shuffle := fmt.Sprintf("shuffle-%v", i)
+        reduce := fmt.Sprintf("mr-out-%v", strconv.Itoa(i))
         task := Task{
           Id: INVALID_TASK_ID,
           Input: shuffle,
@@ -78,17 +79,6 @@ func (c *Coordinator) stageCheck() {
     }
     log.Println("<==== Finish Stage Check")
   }
-}
-// Your code here -- RPC handlers for the worker to call.
-
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-  reply.Y = args.X + 1
-  return nil
 }
 
 func (c *Coordinator) Register(args *RegisterArgs, reply *RegisterReply) error {
@@ -132,7 +122,7 @@ func (c *Coordinator) FetchTask(args* FetchTaskArgs, reply *FetchTaskReply) erro
   executor := c.executors[args.ExecutorId]
   executor.taskId = task.Id
   reply.Task = task
-  log.Printf("Executor-%v Fetch Task-%v", executor.id, task)
+  log.Printf("Executor-%v Fetch %v Task-%v", executor.id, task.Type, task)
   return nil
 }
 
@@ -166,7 +156,7 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) JobDone() bool {
-  return c.stage == JobStageFinish 
+  return c.stage == JobStageFinish
 }
 
 func (c *Coordinator) Done() bool {
@@ -202,9 +192,9 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
     nReduce: uint64(nReduce),}
   // gen map task
   for _, file := range files {
-    task := Task { 
-      Id: INVALID_TASK_ID, 
-      Input: file, 
+    task := Task {
+      Id: INVALID_TASK_ID,
+      Input: file,
       Output: file + "-m",
       Type: TaskTypeMap,
       Status: TaskStatusReady,
