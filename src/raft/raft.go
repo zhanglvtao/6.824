@@ -101,11 +101,8 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	return int(rf.curTerm), rf.role == RaftRoleLeader
 }
 
 //
@@ -285,70 +282,90 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) tickTimeOut() time.Duration {
+	rf.tickMu.Lock()
+	defer rf.tickMu.Unlock()
+	return rf.lastTickTime + rf.lastTimeOut - time.Duration(time.Now().UnixNano())
+}
+
+func (rf *Raft) refreshTimeOut() {
+	rf.tickMu.Lock()
+	defer rf.tickMu.Unlock()
+	rf.lastTickTime = time.Duration(time.Now().UnixNano())
+	rf.lastTimeOut = (time.Duration)(rand.Intn(100)) % 15 * time.Millisecond * 10
+}
+
+func (rf *Raft) convertToLeader() {
+	rf.statusMu.Lock()
+	defer rf.statusMu.Unlock()	
+	// Increment curTerm
+	rf.curTerm = rf.curTerm + 1
+	// Vote for itself
+	rf.voteFor = RaftId(rf.me)
+	// Send RPC
+	args := RequestVoteArgs{
+		CandidateTerm:         rf.curTerm,
+		CandidateId:           rf.id,
+		CandidateLastLogIndex: rf.curLogIndex,
+		CandidateLastLogTerm:  rf.curLogTerm}
+	ch := make(chan *RequestVoteReply)
+	count := 0
+	for peer := range rf.peers {
+		reply := RequestVoteReply{}
+		count++
+		go rf.ChRequestVote(ch, peer, &args, &reply)
+	}
+	majority := count/2 + 1
+	granted := 0
+	for reply := range ch {
+		count--
+		if count == 0 {
+			LOG.Printf("Lose election, %v votes", granted)
+			break
+		}
+		if reply.VoteGranted {
+			granted++
+			LOG.Printf("< Raft-%v granted, term %v", reply.VoterId, reply.VoterTerm)
+		} else {
+			LOG.Printf("< Raft-%v rejected, term %v", reply.VoterId, reply.VoterTerm)
+		}
+		if granted == majority {
+			close(ch)
+			LOG.Println("Win election")
+		}
+	}
+	
+	if granted != majority {
+		LOG.Println("Cancel election -")
+	}
+
+	if (rf.role != RaftRoleCandidate) {
+		return	
+	}
+	LOG.Printf("Convert from %v to Leader", rf.role)
+	rf.role = RaftRoleLeader
+}
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
-// Follower's loop
+// Single goroutine
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// Part 1. Check whether received append entries
-		rf.tickMu.Lock()
-		if rf.lastTickTime+rf.lastTimeOut >= (time.Duration)(time.Now().UnixNano()) {
-			LOG.Println("No new election")
-			rf.tickMu.Unlock()
-			break
+		timeToTimeOut := rf.tickTimeOut()
+		if timeToTimeOut > 0 {
+			time.Sleep(timeToTimeOut)
+			continue
 		}
-		rf.tickMu.Unlock()
 
-		LOG.Println("New election +")
+		LOG.Println("New election +")		
 		// Part 2. incremental curTerm & vote itself & reset election timer && send RequestVote RPC
-		// Increment curTerm
-		rf.curTerm = rf.curTerm + 1
-		// Vote for itself
-		rf.voteFor = RaftId(rf.me)
 		// Reset election timer
-		rf.tickMu.Lock()
-		rf.lastTickTime = time.Duration(time.Now().UnixNano())
-		rf.lastTimeOut = (time.Duration)(rand.Intn(100)) % 15 * time.Millisecond * 10
+		rf.refreshTimeOut()
 		LOG.Printf("Reset election timer tick(%v), time out(%v)", rf.lastTickTime.String(), rf.lastTimeOut.String())
-		// Send RPC
-		args := RequestVoteArgs{
-			CandidateTerm:         rf.curTerm,
-			CandidateId:           rf.id,
-			CandidateLastLogIndex: rf.curLogIndex,
-			CandidateLastLogTerm:  rf.curLogTerm}
-		ch := make(chan *RequestVoteReply)
-		count := 0
-		for peer := range rf.peers {
-			reply := RequestVoteReply{}
-			count++
-			go rf.ChRequestVote(ch, peer, &args, &reply)
-		}
-		majority := count/2 + 1
-		granted := 0
-		for reply := range ch {
-			count--
-			if count == 0 {
-				LOG.Printf("Lost election, %v votes", granted)
-				break
-			}
-			if reply.VoteGranted {
-				granted++
-				LOG.Printf("< Raft-%v granted, term %v", reply.VoterId, reply.VoterTerm)
-			} else {
-				LOG.Printf("< Raft-%v rejected, term %v", reply.VoterId, reply.VoterTerm)
-			}
-			if granted == majority {
-				close(ch)
-				LOG.Println("Win election")
-			}
-		}
-		// (TODO 10/20) If cur is NOT candidate, so it can't convert to Leader
-		// Consider above Part2 and below as Atomic ?
-		LOG.Printf("Raft-%v convert from %v to Leader", rf.id, rf.role)
-		rf.role = RaftRoleLeader
+		rf.convertToLeader()
 	}
 }
 
