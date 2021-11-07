@@ -95,7 +95,7 @@ type Raft struct {
   commitIndex    LogIndex // index of the highest log entry known to be committed
   lastApplied    LogIndex // index of the highest log entry applied to state machine
 
-  statusMu       *sync.Mutex
+  statMu       	 *ChanMutex
   curTerm        Term
   voteFor        RaftId
   role           RaftRole
@@ -232,8 +232,8 @@ func (rf *Raft) refreshTimeOut() {
 }
 
 func (rf *Raft) InCandidate() {
-  rf.statusMu.Lock()
-  defer rf.statusMu.Unlock()
+	rf.statMu.Lock()
+	defer rf.statMu.Unlock()
   // Convert to condidate
   rf.role = RaftRoleCandidate
   // Increment curTerm
@@ -260,7 +260,7 @@ func (rf *Raft) InCandidate() {
 			VoteGranted: false}
     count++
 		rf.LOG.Printf("ChRequestVote to %v", peer)
-    go rf.ChRequestVote(ch, peer, &args, &reply)
+    go rf.ChanRequestVote(ch, peer, &args, &reply)
   }
 	//rf.LOG.Println("DEBUG: waiting for RPC reply")
   majority := count/2 + 1
@@ -377,7 +377,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
     id:          RaftId(me),
     curLogIndex: 0,
     curLogTerm:  0,
-    statusMu:    &sync.Mutex{},
+    statMu:    	 NewChanMutex(),
     curTerm:     0,
     voteFor:     InvalidRaftId,
     role:        RaftRoleFollower,

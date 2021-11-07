@@ -37,7 +37,7 @@ type AppendEntriesReply struct {
   Success     bool
 }
 
-func (rf *Raft) ChRequestVote(ch chan *RequestVoteReply, server int, args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) ChanRequestVote(ch chan *RequestVoteReply, server int, args *RequestVoteArgs, reply *RequestVoteReply) {
   ok := rf.sendRequestVote(server, args, reply)
 	if !ok {
 	  rf.LOG.Printf("- RPC::RequestVote(SendTo %v) Fail", reply.VoterId)
@@ -54,13 +54,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
   // Condition 1: Term dismatch OR log index dismatch
   reply.VoterTerm = rf.curTerm
   reply.VoterId = rf.id
+	reply.VoteGranted = false
 	if args.CandidateTerm <= rf.curTerm {
-		reply.VoteGranted = false
 		rf.LOG.Printf("> Reject vote candidate %v, term %v left behind %v", args.CandidateId, args.CandidateTerm, rf.curTerm)
 		return
 	}
   if args.CandidateLastLogIndex < rf.curLogIndex {
-    reply.VoteGranted = false
 		rf.LOG.Printf("> Reject vote candidate %v, log-index %v left behind of %v", args.CandidateId, args.CandidateLastLogIndex, rf.curLogIndex)
     return
   }
@@ -68,7 +67,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	//	rf.LOG.Printf("> Reject vote, has granted to %v", rf.voteFor)
 	//}
   // Condition 2: Vote
-	rf.statusMu.Lock()
+	if !rf.statMu.TryLock() {
+		rf.LOG.Printf("> Reject vote candidate %v, unable to acquire statMu", args.CandidateId)
+		return
+	}
+	defer rf.statMu.Unlock()
 	if args.CandidateTerm <= rf.curTerm {
 		reply.VoteGranted = false
 		rf.LOG.Printf("> Reject vote candidate %v, term %v left behind %v", args.CandidateId, args.CandidateTerm, rf.curTerm)		
@@ -79,7 +82,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.LOG.Printf("> Reject vote candidate %v, log-index %v left behind of %v", args.CandidateId, args.CandidateLastLogIndex, rf.curLogIndex)
     return
   }
-	defer rf.statusMu.Unlock()
   rf.voteFor = args.CandidateId
 	old := rf.curTerm
 	rf.curTerm = args.CandidateTerm
@@ -124,36 +126,37 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 // As receiver
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	reply.Success = false
+	reply.FollowTerm = rf.curLogTerm
   if args.LeaderTerm < rf.curTerm {
-    reply.Success = false
-		reply.FollowTerm = rf.curTerm
     rf.LOG.Printf("+ RPC::AppendEntries Raft-%v should convert to follower", args.LeaderId)//. Term dismatch follower %v, leader %v", rf.curTerm, args.LeaderTerm)
     return
   }
+	if !rf.statMu.TryLock() {
+		return
+	}
+	defer rf.statMu.Unlock()
+	if args.LeaderTerm < rf.curTerm {
+		reply.FollowTerm = rf.curTerm
+		rf.LOG.Printf("+ RPC::AppendEntries Raft-%v should convert to follower", args.LeaderId)//. Term dismatch follower %v, leader %v", rf.curTerm, args.LeaderTerm)
+		return
+	}
   reply.Success = true
 	reply.FollowTerm = rf.curLogTerm
-
-	rf.statusMu.Lock()
-  if args.LeaderTerm < rf.curTerm {
-    reply.Success = false
-		reply.FollowTerm = rf.curTerm
-    rf.LOG.Printf("+ RPC::AppendEntries Raft-%v should convert to follower", args.LeaderId)//. Term dismatch follower %v, leader %v", rf.curTerm, args.LeaderTerm)
-    return
-  }
 	rf.role = RaftRoleFollower
-	rf.statusMu.Unlock()
 	rf.refreshTimeOut()
 	rf.LOG.Printf("+ RPC::AppendEntries")// Refresh lastTickTime %v, lastTimeOut %v", rf.lastTickTime, rf.lastTimeOut)
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
   ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if reply.FollowTerm > rf.curLogTerm {
-		rf.statusMu.Lock()
-		defer rf.statusMu.Unlock()
-		rf.role = RaftRoleFollower
-		rf.LOG.Printf("sendAppendEntries: Leader => %v", rf.role)
+	if reply.FollowTerm <= rf.curLogTerm {
+		return ok
 	}
+	rf.statMu.Lock()
+	defer rf.statMu.Unlock()
+  rf.role = RaftRoleFollower
+  rf.LOG.Printf("sendAppendEntries: Leader => %v", rf.role)
   return ok
 }
 
