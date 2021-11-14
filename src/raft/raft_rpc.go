@@ -1,5 +1,7 @@
 package raft
 
+import "time"
+
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -52,16 +54,27 @@ func (rf *Raft) ChanRequestVote(ch chan *RequestVoteReply, server int, args *Req
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
   // Your code here (2A, 2B).
   // Condition 1: Term dismatch OR log index dismatch
-   if !rf.statMu.TryLock() {
-    rf.LOG.Printf("> Reject vote candidate %v, unable to acquire statMu", args.CandidateId)
-    return
+  trial := 0
+  for {
+    if rf.statMu.TryLock() {
+      break;
+    }
+    trial++;
+    if trial == 10 {
+      rf.LOG.Printf("> Reject vote candidate %v, unable to acquire statMu", args.CandidateId)
+    }
+    time.Sleep(5 * time.Millisecond)
   }
+  //if !rf.statMu.TryLock() {
+  //  rf.LOG.Printf("> Reject vote candidate %v, unable to acquire statMu", args.CandidateId)
+  //  return
+  //}
   defer rf.statMu.Unlock() 
   reply.VoterTerm = rf.curTerm
   reply.VoterId = rf.id
   reply.VoteGranted = false
   if args.CandidateTerm <= rf.curTerm {
-    rf.LOG.Printf("> Reject vote candidate %v, term %v left behind %v", args.CandidateId, args.CandidateTerm, rf.curTerm)
+    rf.LOG.Printf("> Reject vote candidate %v, term %v left behind me %v", args.CandidateId, args.CandidateTerm, rf.curTerm)
     return
   }
   if args.CandidateLastLogIndex < rf.curLogIndex {
@@ -111,10 +124,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
   reply.Success = false
   reply.FollowTerm = rf.curLogTerm
   reply.FollowId = rf.id
-  if args.LeaderTerm < rf.curTerm {
-    rf.LOG.Printf("+ RPC::AppendEntries Raft-%v should convert to follower", args.LeaderId)//. Term dismatch follower %v, leader %v", rf.curTerm, args.LeaderTerm)
-    return
-  }
+  //if args.LeaderTerm < rf.curTerm {
+  //  rf.LOG.Printf("+ RPC::AppendEntries Raft-%v should convert to follower", args.LeaderId)//. Term dismatch follower %v, leader %v", rf.curTerm, args.LeaderTerm)
+  //  return
+  //}
+  rf.refreshTimeOut()
   if !rf.statMu.TryLock() {
     return
   }
@@ -127,6 +141,5 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
   reply.Success = true
   reply.FollowTerm = rf.curLogTerm
   rf.role = RaftRoleFollower
-  rf.refreshTimeOut()
   rf.LOG.Printf("+ RPC::AppendEntries")// Refresh lastTickTime %v, lastTimeOut %v", rf.lastTickTime, rf.lastTimeOut)
 }

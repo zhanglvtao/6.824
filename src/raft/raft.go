@@ -75,7 +75,7 @@ const  InvalidRaftId     RaftId = -1
 const InvalidRaftTerm   Term = -1
 // Base election time out.
 // From paper, 150ms - 300ms. Ref to 5.6 Timing and availability
-const BaseElectionTimeOut time.Duration = time.Millisecond * 150
+const BaseElectionTimeOut time.Duration = time.Millisecond * 100
 
 type Raft struct {
   mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -112,6 +112,8 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
   // Your code here (2A).
+	rf.statMu.Lock()
+	defer rf.statMu.Unlock()
   return int(rf.curTerm), rf.role == RaftRoleLeader
 }
 
@@ -228,7 +230,7 @@ func (rf *Raft) refreshTimeOut() {
   rf.tickMu.Lock()
   defer rf.tickMu.Unlock()
   rf.lastTickTime = time.Duration(time.Now().UnixNano())
-  rf.lastTimeOut = (time.Duration)(rand.Intn(100))%15*time.Millisecond*10 + time.Millisecond*150
+  rf.lastTimeOut = (time.Duration)(rand.Intn(100))%15*time.Millisecond*10 + BaseElectionTimeOut
   rf.LOG.Printf("Refresh time out from %v, after %v", rf.lastTickTime, rf.lastTimeOut)
 
 }
@@ -241,17 +243,18 @@ func (rf *Raft) InCandidate() {
   rf.statMu.Lock()
   // 2.Convert to condidate
   rf.role = RaftRoleCandidate
-  // 3.Increment curTerm
-  old := rf.curTerm
-  rf.curTerm = old + 1
-  rf.LOG.Printf("Increment curTerm from %v to %v", old, rf.curTerm)
+  // 3.Increment oldTerm
+  oldTerm := rf.curTerm
+  rf.curTerm = oldTerm + 1
+	newTerm := rf.curTerm
+  rf.LOG.Printf("Increment curTerm from %v to %v", oldTerm, rf.curTerm)
   // 4.Vote for itself
   rf.voteFor = RaftId(rf.me)
   rf.statMu.Unlock()
 
   // 5.Send RPC
   args := RequestVoteArgs{
-    CandidateTerm:         rf.curTerm,
+    CandidateTerm:         newTerm,
     CandidateId:           rf.id,
     CandidateLastLogIndex: rf.curLogIndex,
     CandidateLastLogTerm:  rf.curLogTerm}
@@ -294,7 +297,7 @@ func (rf *Raft) InCandidate() {
 
   rf.statMu.Lock()
   defer rf.statMu.Unlock()
-  if (rf.curTerm != old + 1) {
+  if (rf.curTerm != oldTerm + 1) {
     rf.LOG.Printf("Abort election, term %v", rf.curTerm)
     return
   }
@@ -310,15 +313,17 @@ func (rf *Raft) InCandidate() {
 }
 
 func (rf *Raft) InLeader() {
+	rf.statMu.Lock()
   curTerm := rf.curTerm
+	rf.statMu.Unlock()
   ch := make(chan *AppendEntriesReply)
-  count := 0
+  count := len(rf.peers)
   for peer := range rf.peers {
     if peer == rf.me {
       continue
     }
     args := AppendEntriesArgs {
-      LeaderTerm: rf.curTerm,
+      LeaderTerm: curTerm,
       LeaderId: rf.id,
       PreLogIndex: rf.curLogIndex,
       PreLogTerm: rf.curLogTerm,
@@ -333,7 +338,7 @@ func (rf *Raft) InLeader() {
     count--
     received++
     if received >= majority {
-      rf.LOG.Printf("Continue be Leader, received %v append reply", received)
+      rf.LOG.Printf("Continue be Leader, received %v/%v append reply", received, len(rf.peers))
       break
     }
     if count == 0 {
@@ -383,11 +388,14 @@ func (rf *Raft) tickerLoop() {
 
 func (rf *Raft) appendEntriesLoop() {
   for !rf.killed() {
-    if rf.role != RaftRoleLeader {
+		rf.statMu.Lock()
+		curRole := rf.role
+		rf.statMu.Unlock()
+    if curRole != RaftRoleLeader {
       continue
     }
     rf.InLeader()
-    time.Sleep(time.Millisecond * 75)
+		time.Sleep(50 * time.Millisecond)
   }
 }
 
