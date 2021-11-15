@@ -30,7 +30,7 @@ type AppendEntriesArgs struct {
   LeaderId     RaftId
   PreLogIndex  LogIndex
   PreLogTerm   Term
-  Entries[]    Entry
+  Entries[]    LogEntry
   LeaderCommit LogIndex // leader's commit index
 }
 
