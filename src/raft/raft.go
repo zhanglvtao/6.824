@@ -54,7 +54,14 @@ type ApplyMsg struct {
   SnapshotIndex int
 }
 
-type Entry struct {
+type LogEntry struct {
+  Term    Term
+  Index   LogIndex
+  Command interface{}
+}
+
+func (le *LogEntry) String() string {
+  return fmt.Sprintf("(T%v, I%v, C'%v')", le.Term, le.Index, le.Command)
 }
 
 //
@@ -64,18 +71,6 @@ type Term int64
 type RaftId int64
 type LogIndex uint64
 type RaftRole string
-
-const (
-  RaftRoleLeader    RaftRole = "Leader"
-  RaftRoleCandidate RaftRole = "Candidate"
-  RaftRoleFollower  RaftRole = "Follower"
-)
-
-const  InvalidRaftId     RaftId = -1
-const InvalidRaftTerm   Term = -1
-// Base election time out.
-// From paper, 150ms - 300ms. Ref to 5.6 Timing and availability
-const BaseElectionTimeOut time.Duration = time.Millisecond * 100
 
 type Raft struct {
   mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -88,33 +83,53 @@ type Raft struct {
   // Look at the paper's Figure 2 for a description of what
   // state a Raft server must maintain.
   // 2A:
-  id             RaftId
+  id RaftId
 
-  curLogIndex    LogIndex
-  curLogTerm     Term
-  commitIndex    LogIndex // index of the highest log entry known to be committed
-  lastApplied    LogIndex // index of the highest log entry applied to state machine
+  // The top log index
+  curLogMu    *sync.RWMutex // protect curLogIndex and curLogTerm
+  curLogIndex LogIndex
+  curLogTerm  Term
 
-  statMu         *ChanMutex
-  curTerm        Term
-  voteFor        RaftId
-  role           RaftRole
+  commitIdxMu *sync.RWMutex // protect commitIndex
+  commitIndex LogIndex      // index of the highest log entry known to be committed
+  lastApplyMu *sync.RWMutex // protect lastApplied
+  lastApplied LogIndex      // index of the highest log entry applied to state machine
 
-  tickMu         *sync.Mutex
-  lastTimeOut    time.Duration // Nanosecond
-  lastTickTime   time.Duration // AppendEntries write <=> Election timer read
+  matchedIdxMu  *sync.RWMutex
+  matchedIndex  LogIndex  // Only used by follower to determine which logs are valid to apply to application
 
-  LOG            *log.Logger
+  statMu  *sync.RWMutex // protect curTerm, voteFor, role
+  curTerm Term
+  voteFor RaftId
+  role    RaftRole
 
+  tickMu       *sync.RWMutex
+  lastTimeOut  time.Duration // Nanosecond
+  lastTickTime time.Duration // AppendEntries write <=> Election timer read
+
+  LOG *log.Logger
+
+  // 2B
+  commitCh chan *LogEntry
+  persisCh chan *LogEntry
+
+  applyCh chan ApplyMsg
+
+  nextIdxMu  *sync.RWMutex
+  nextIndex  []LogIndex // What the log entry index the leader are supposed to send to follower.
+  matchIdxMu *sync.RWMutex
+  matchIndex []LogIndex // Each follower's highest log entry index that replicated.
+
+  logEntriesMu *sync.RWMutex
+  logEntries   []*LogEntry
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
   // Your code here (2A).
-	rf.statMu.Lock()
-	defer rf.statMu.Unlock()
-  return int(rf.curTerm), rf.role == RaftRoleLeader
+  term, role, _ := rf.SyncGetRaftStat()
+  return int(term), role == RaftRoleLeader
 }
 
 //
@@ -193,10 +208,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
   index := -1
   term := -1
   isLeader := true
-
   // Your code here (2B).
-
-  return index, term, isLeader
+  _, role, _ := rf.SyncGetRaftStat()
+  if role != RaftRoleLeader {
+    rf.LOG.Printf("❌ Start warn. Not LEADER, but FOLLOWER %v", rf.me)
+    return index, term, false
+  }
+  newEntry := rf.appendNewEntry(command)
+  rf.SyncSetMatchIndex(rf.id, newEntry.Index)
+  rf.LOG.Printf("Set rf.id(%v)", rf.id)
+  rf.LOG.Printf("🚗 Started entry %v", newEntry)
+  rf.curLogMu.RLock()
+  defer rf.curLogMu.RUnlock()
+  return int(rf.curLogIndex), int(rf.curLogTerm), isLeader
 }
 
 //
@@ -221,189 +245,20 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) tickTimeOut() time.Duration {
-  rf.tickMu.Lock()
-  defer rf.tickMu.Unlock()
+  rf.tickMu.RLock()
+  defer rf.tickMu.RUnlock()
   return rf.lastTickTime + rf.lastTimeOut - time.Duration(time.Now().UnixNano())
 }
 
 func (rf *Raft) refreshTimeOut() {
+  now := time.Duration(time.Now().UnixNano())
+  last := (time.Duration)(rand.Intn(100))%15*time.Millisecond*10 + SleepElection
   rf.tickMu.Lock()
-  defer rf.tickMu.Unlock()
-  rf.lastTickTime = time.Duration(time.Now().UnixNano())
-  rf.lastTimeOut = (time.Duration)(rand.Intn(100))%15*time.Millisecond*10 + BaseElectionTimeOut
-  rf.LOG.Printf("Refresh time out from %v, after %v", rf.lastTickTime, rf.lastTimeOut)
-
+  rf.lastTickTime = time.Duration(now)
+  rf.lastTimeOut = last
+  rf.tickMu.Unlock()
 }
 
-func (rf *Raft) InCandidate() {
-  rf.LOG.Println("+ New election")
-  // 1.Refresh election timer
-  rf.refreshTimeOut()
-
-  rf.statMu.Lock()
-  // 2.Convert to condidate
-  rf.role = RaftRoleCandidate
-  // 3.Increment oldTerm
-  oldTerm := rf.curTerm
-  rf.curTerm = oldTerm + 1
-	newTerm := rf.curTerm
-  rf.LOG.Printf("Increment curTerm from %v to %v", oldTerm, rf.curTerm)
-  // 4.Vote for itself
-  rf.voteFor = RaftId(rf.me)
-  rf.statMu.Unlock()
-
-  // 5.Send RPC
-  args := RequestVoteArgs{
-    CandidateTerm:         newTerm,
-    CandidateId:           rf.id,
-    CandidateLastLogIndex: rf.curLogIndex,
-    CandidateLastLogTerm:  rf.curLogTerm}
-  ch := make(chan *RequestVoteReply)
-  count := 0
-  for peer := range rf.peers {
-    if peer == rf.me {
-      continue
-    }
-    reply := RequestVoteReply{
-      VoterTerm: InvalidRaftTerm,
-      VoterId: RaftId(peer),
-      VoteGranted: false}
-    count++
-    rf.LOG.Printf("ChRequestVote to %v", peer)
-    go rf.ChanRequestVote(ch, peer, &args, &reply)
-  }
-  majority := count/2 + 1
-  granted := 1
-  for reply := range ch {
-    count--
-    if reply.VoteGranted {
-      granted++
-      rf.LOG.Printf("< Raft-%v granted with term %v", reply.VoterId, reply.VoterTerm)
-    } else {
-      rf.LOG.Printf("< Raft-%v rejected with term %v", reply.VoterId, reply.VoterTerm)
-    }
-    // If received majority of peers' granted vote. Not wait within the loop anymore.
-    if granted >= majority {
-      rf.LOG.Println("Recevied majortiy peers' grant. Break loop")
-      break
-    }
-    // If received all votes
-    if count == 0 {
-      close(ch)
-      rf.LOG.Printf("Received all peers' vote. Close channel")
-      break
-    }
-  }
-
-  rf.statMu.Lock()
-  defer rf.statMu.Unlock()
-  if (rf.curTerm != oldTerm + 1) {
-    rf.LOG.Printf("Abort election, term %v", rf.curTerm)
-    return
-  }
-  if granted < majority {
-    rf.LOG.Printf("Lose election, %v votes", granted)
-    rf.role = RaftRoleFollower
-    rf.voteFor = InvalidRaftId
-    return
-  }
-
-  rf.LOG.Printf("Win election, %v votes. Convert from %v to Leader", granted, rf.role)
-  rf.role = RaftRoleLeader
-}
-
-func (rf *Raft) InLeader() {
-	rf.statMu.Lock()
-  curTerm := rf.curTerm
-	rf.statMu.Unlock()
-  ch := make(chan *AppendEntriesReply)
-  count := len(rf.peers)
-  for peer := range rf.peers {
-    if peer == rf.me {
-      continue
-    }
-    args := AppendEntriesArgs {
-      LeaderTerm: curTerm,
-      LeaderId: rf.id,
-      PreLogIndex: rf.curLogIndex,
-      PreLogTerm: rf.curLogTerm,
-      Entries: make([]Entry, 0),
-      LeaderCommit: rf.commitIndex}
-    reply := AppendEntriesReply{}
-    go rf.ChanSendAppendEntries(ch, peer, &args, &reply)
-  }
-  majority := count/2 + 1
-  received := 1
-  for range ch {
-    count--
-    received++
-    if received >= majority {
-      rf.LOG.Printf("Continue be Leader, received %v/%v append reply", received, len(rf.peers))
-      break
-    }
-    if count == 0 {
-      close(ch)
-      rf.LOG.Printf("Close append channel")
-      break
-    }
-  }
-  if received >= majority {
-    rf.refreshTimeOut()
-    return
-  }
-
-  rf.statMu.Lock()
-  defer rf.statMu.Unlock()
-  if rf.role == RaftRoleLeader && rf.curTerm == curTerm {
-    rf.role = RaftRoleFollower
-    rf.LOG.Printf("Leader => Follower, not receive enought append reply")
-  }
-}
-// The tickerLoop go routine starts a new election if this peer hasn't received
-// heartsbeats recently.
-// Single goroutine
-func (rf *Raft) tickerLoop() {
-  // init timer
-  rf.refreshTimeOut()
-  for rf.killed() == false {
-    // Your code here to check if a leader election should
-    // be started and to randomize sleeping time using
-    //if rf.role == RaftRoleLeader {
-    //  rf.LOG.Printf("- Leader Term %v", rf.curTerm)
-    //  time.Sleep(rf.lastTimeOut)
-    //  continue
-    //}
-    // Part 1. Check whether received append entries
-    timeToTimeOut := rf.tickTimeOut()
-    if timeToTimeOut > 0 {
-      time.Sleep(timeToTimeOut)
-      continue
-    }
-
-    // Part 2. incremental curTerm & vote itself & reset election timer && send RequestVote RPC
-    rf.refreshTimeOut()
-    go rf.InCandidate()
-  }
-}
-
-func (rf *Raft) appendEntriesLoop() {
-  for !rf.killed() {
-		rf.statMu.Lock()
-		curRole := rf.role
-		rf.statMu.Unlock()
-    if curRole != RaftRoleLeader {
-      continue
-    }
-    rf.InLeader()
-		time.Sleep(50 * time.Millisecond)
-  }
-}
-
-func (rf *Raft) String() string {
-  return fmt.Sprintf(
-    "id %v, curLogIndex: %v, curLogTerm %v, commitIndex %v, lastApplied %v, curTerm %v, voteFor %v, role %v, lastTimeOut %v, lastTickTime %v",
-     rf.id, rf.curLogIndex, rf.curLogTerm, rf.commitIndex, rf.lastApplied, rf.curTerm, rf.voteFor, rf.role, rf.lastTimeOut, rf.lastTickTime)
-}
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -420,29 +275,56 @@ var LOG log.Logger
 func Make(peers []*labrpc.ClientEnd, me int,
   persister *Persister, applyCh chan ApplyMsg) *Raft {
   LOG = *log.New(os.Stdout, "Raft Maker ", log.Ltime|log.Lshortfile)
+  raftLog := log.New(os.Stdout, fmt.Sprintf("Raft-%v ", me), log.Ltime|log.Lshortfile)
+  f, err := os.OpenFile(fmt.Sprintf("logs/peer-log.%v", time.Now().Unix()), os.O_RDWR | os.O_CREATE | os.O_APPEND, 0666)
+  if err != nil {
+      log.Fatalf("error opening file: %v", err)
+  }
+  defer f.Close()
+  //raftLog.SetOutput(f)
+  //LOG.SetOutput(f)
   rf := &Raft{
-    mu:          sync.Mutex{},
-    id:          RaftId(me),
-    curLogIndex: 0,
-    curLogTerm:  0,
-    statMu:       NewChanMutex(),
-    curTerm:     0,
-    voteFor:     InvalidRaftId,
-    role:        RaftRoleFollower,
-    tickMu:      &sync.Mutex{},
-    LOG:              log.New(os.Stdout, fmt.Sprintf("Raft-%v ", me), log.Ltime|log.Lshortfile)}
-  rf.peers = peers
-  rf.persister = persister
-  rf.me = me
+    mu:           sync.Mutex{},
+    peers:        peers,
+    persister:    persister,
+    me:           me,
+    id:           RaftId(me),
+    curLogMu:     &sync.RWMutex{},
+    curLogIndex:  LogIndexInitial,
+    curLogTerm:   RaftTermInitial,
+    commitIdxMu:  &sync.RWMutex{},
+    commitIndex:  LogIndexInitial,
+    lastApplyMu:  &sync.RWMutex{},
+    lastApplied:  LogIndexInitial,
+    statMu:       &sync.RWMutex{},
+    curTerm:      RaftTermInvalid,
+    voteFor:      RaftIdInvalid,
+    role:         RaftRoleFollower,
+    tickMu:       &sync.RWMutex{},
+    applyCh:      applyCh,
+    commitCh:     make(chan *LogEntry),
+    persisCh:     make(chan *LogEntry),
+    nextIndex:    make([]LogIndex, len(peers)),
+    nextIdxMu:    &sync.RWMutex{},
+    matchIndex:   make([]LogIndex, len(peers)),
+    matchIdxMu:   &sync.RWMutex{},
+    matchedIdxMu: &sync.RWMutex{},
+    matchedIndex: LogIndexInitial,
+    logEntriesMu: &sync.RWMutex{},
+    logEntries:   make([]*LogEntry, 0, 128),
+    LOG:          raftLog}
 
   // Your initialization code here (2A, 2B, 2C).
+  rf.InitLogEntries()
+  rf.InitNextIndex()
 
   // initialize from state persisted before a crash
   rf.readPersist(persister.ReadRaftState())
 
   LOG.Printf("Make Raft %v", rf)
-  go rf.appendEntriesLoop()
-  go rf.tickerLoop()
+  go rf.electLoop()
+  go rf.applyLoop()
+  go rf.watchLogEntriesLoop()
 
   return rf
 }

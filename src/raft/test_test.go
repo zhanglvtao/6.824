@@ -197,6 +197,7 @@ func TestFailAgree2B(t *testing.T) {
 
 	// disconnect one follower from the network.
 	leader := cfg.checkOneLeader()
+	LOG.Printf("disconnect %v", (leader + 1) % servers)
 	cfg.disconnect((leader + 1) % servers)
 
 	// the leader and remaining follower should be
@@ -262,7 +263,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	if ok2 == false {
 		t.Fatalf("leader2 rejected Start()")
 	}
-	if index2 < 2 || index2 > 3 {
+	if index2 < 2 || index2 > 4 {
 		t.Fatalf("unexpected index %v", index2)
 	}
 
@@ -432,9 +433,11 @@ func TestBackup2B(t *testing.T) {
 
 	time.Sleep(RaftElectionTimeout / 2)
 
+	fmt.Printf("Disconnect leader1 %v follower %v", (leader1 + 0) % servers, (leader1 + 1) % servers)
 	cfg.disconnect((leader1 + 0) % servers)
 	cfg.disconnect((leader1 + 1) % servers)
 
+	fmt.Printf("Reconnect %v %v %v", (leader1 + 2) % servers, (leader1 + 3) % servers,(leader1 + 4) % servers)
 	// allow other partition to recover
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
@@ -451,8 +454,10 @@ func TestBackup2B(t *testing.T) {
 	if leader2 == other {
 		other = (leader2 + 1) % servers
 	}
+	fmt.Printf("Disconnect follower %v from leader2 %v of group of 3", other, leader2)
 	cfg.disconnect(other)
 
+	fmt.Printf("Below started entry will not be committed")
 	// lots more commands that won't commit
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader2].Start(rand.Int())
@@ -460,24 +465,28 @@ func TestBackup2B(t *testing.T) {
 
 	time.Sleep(RaftElectionTimeout / 2)
 
+	fmt.Printf("Disconnect all servers")
 	// bring original leader back to life,
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
 	}
+	fmt.Printf("Connect %v %v %v as group", (leader1 + 0) % servers, (leader1 + 1) % servers, other)
 	cfg.connect((leader1 + 0) % servers)
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
 
+	fmt.Printf("Below started entry should be committed")
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
 
+	fmt.Printf("Connect all server")
 	// now everyone
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
 	}
-	cfg.one(rand.Int(), servers, true)
+	cfg.one(999999, servers, true)
 
 	cfg.end()
 }
