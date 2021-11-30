@@ -11,6 +11,7 @@ func (rf *Raft) appendLoop() {
 		if curRole != RaftRoleLeader {
 			continue
 		}
+		// Append entry as leader
 		rf.InLeader()
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -42,3 +43,5 @@ func (rf *Raft) tickerLoop() {
 		go rf.InCandidate()
 	}
 }
+
+func 
