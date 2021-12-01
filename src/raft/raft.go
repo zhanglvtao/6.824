@@ -122,7 +122,9 @@ type Raft struct {
 
   applyCh chan  ApplyMsg
 
+  nextIdxMu     *ChanMutex
   nextIndex     []LogIndex // What the log entry index the leader are supposed to send to follower.
+  matchIdxMu    *ChanMutex
   matchIndex    []LogIndex // Each follower's highest log entry index that replicated.
 
   entriesMu     *ChanMutex
@@ -349,11 +351,7 @@ func (rf *Raft) InCandidate() {
   rf.role = RaftRoleLeader
 
   // After just as leader
-  rf.curLogMu.Lock()
-  defer rf.curLogMu.Unlock()
-  for i,_ := range rf.nextIndex {
-    rf.nextIndex[i] = rf.curLogIndex + 1
-  }	
+  rf.InitNextIndex()
   newLogIndex := rf.curLogIndex + 1
   noOp := &LogEntry{ Term: rf.curTerm, Index: newLogIndex, Command: "NoOperation"}
   rf.commitCh <- noOp
@@ -428,6 +426,18 @@ func (rf *Raft) String() string {
     rf.id, rf.curLogIndex, rf.curLogTerm, rf.commitIndex, rf.lastApplied, rf.curTerm, rf.voteFor, rf.role, rf.lastTimeOut, rf.lastTickTime)
 }
 
+func (rf *Raft) InitNextIndex() {
+  rf.nextIdxMu.Lock()
+  rf.curLogMu.Lock()
+  curLogIndex := rf.curLogIndex
+  rf.curLogMu.Unlock()
+  defer rf.nextIdxMu.Unlock()
+  for i := range rf.nextIndex {
+    rf.nextIndex[i] = curLogIndex + 1
+  }
+  rf.LOG.Printf("Init next index %v", curLogIndex + 1)
+}
+
 func (rf *Raft) AppendLogEntry(entry *LogEntry) {
   idx := entry.Index
   rf.entriesMu.Lock()
@@ -468,6 +478,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
     persister: 		persister,
     me: 					me,
     id:           RaftId(me),
+    curLogMu:     NewChanMutex(),
     curLogIndex:  InvalidLogIndex,
     curLogTerm:   0,
     commitIdxMu: 	NewChanMutex(),
@@ -483,20 +494,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
     commitCh:     make(chan *LogEntry),
     persisCh:     make(chan *LogEntry),
     nextIndex:    make([]LogIndex, len(peers)),
+    nextIdxMu:    NewChanMutex(),
     matchIndex:   make([]LogIndex, len(peers)),
+    matchIdxMu:   NewChanMutex(),
     entriesMu:    NewChanMutex(),
     logEntries:   make([]*LogEntry, 0, 128),
     LOG:          log.New(os.Stdout, fmt.Sprintf("Raft-%v ", me), log.Ltime|log.Lshortfile)}
 
   // Your initialization code here (2A, 2B, 2C).
   rf.AppendLogEntry(&LogEntry{ Term: 0, Index: InvalidLogIndex, Command: nil})
+  rf.InitNextIndex()
 
   // initialize from state persisted before a crash
   rf.readPersist(persister.ReadRaftState())
 
   LOG.Printf("Make Raft %v", rf)
   go rf.appendLoop()
-  go rf.tickerLoop()
+  go rf.electLoop()
+  go rf.applyLoop()
+  go rf.commitLoop()
 
   return rf
 }

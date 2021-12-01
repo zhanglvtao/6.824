@@ -63,7 +63,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     }
     trial++;
     if trial == 10 {
-      rf.LOG.Printf("> Reject vote candidate %v, unable to acquire statMu", args.CandidateId)
+      rf.LOG.Printf("> Reject vote candidate %v, statMu busy", args.CandidateId)
     }
     time.Sleep(5 * time.Millisecond)
   }
@@ -82,6 +82,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
   }
 
   // Condition 2: Vote
+  rf.refreshTimeOut()
   rf.voteFor = args.CandidateId
   old := rf.curTerm
   rf.curTerm = args.CandidateTerm
@@ -118,10 +119,12 @@ func (rf *Raft) ChanSendAppendEntries(ch chan *AppendEntriesReply, server int, a
       return
     }
     rf.nextIndex[server] = rf.nextIndex[server] + 1
+    rf.matchIndex[server] = rf.nextIndex[server] - 1
     rf.LOG.Printf("::SendAppendEntries(TO %v) Ok. Now match %v, next %v", server, rf.matchIndex[server], rf.nextIndex[server])
     return
   }
   rf.nextIndex[server] = rf.nextIndex[server] - 1
+  rf.matchIndex[server] = 0
   rf.LOG.Printf("::SendAppendEntries(TO %v) Fail. Now match %v, next %v", server, rf.matchIndex[server], rf.nextIndex[server])
 }
 
