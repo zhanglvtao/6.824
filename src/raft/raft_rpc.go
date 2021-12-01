@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"time"
 )
 
 //
@@ -56,23 +55,13 @@ func (rf *Raft) ChanRequestVote(ch chan *RequestVoteReply, server int, args *Req
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
   // Your code here (2A, 2B).
   // Condition 1: Term dismatch OR log index dismatch
-  trial := 0
-  for {
-    if rf.statMu.TryLock() {
-      break;
-    }
-    trial++;
-    if trial == 10 {
-      rf.LOG.Printf("> Reject vote candidate %v, statMu busy", args.CandidateId)
-    }
-    time.Sleep(5 * time.Millisecond)
-  }
-
-  defer rf.statMu.Unlock() 
+  rf.statMu.RLock()
   reply.VoterTerm = rf.curTerm
+  rf.statMu.RUnlock()
   reply.VoterId = rf.id
   reply.VoteGranted = false
-  if args.CandidateTerm <= rf.curTerm {
+  
+  if args.CandidateTerm <= reply.VoterTerm {
     rf.LOG.Printf("> Reject vote candidate %v, term %v left behind me %v", args.CandidateId, args.CandidateTerm, rf.curTerm)
     return
   }
@@ -83,6 +72,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
   // Condition 2: Vote
   rf.refreshTimeOut()
+  rf.statMu.Lock()
+  defer rf.statMu.Unlock()
   rf.voteFor = args.CandidateId
   old := rf.curTerm
   rf.curTerm = args.CandidateTerm
@@ -104,9 +95,12 @@ func (rf *Raft) ChanSendAppendEntries(ch chan *AppendEntriesReply, server int, a
     rf.LOG.Printf("::SendAppendEntires(TO %v) Fail with network error", reply.FollowId)
     return
   }
-  rf.statMu.Lock()
-  defer rf.statMu.Unlock()
-  if reply.FollowTerm > rf.curTerm {
+  rf.statMu.RLock()
+  curTerm := rf.curTerm
+  rf.statMu.RUnlock()
+  if reply.FollowTerm > curTerm {
+    rf.statMu.Lock()
+    defer rf.statMu.Unlock()
     rf.role = RaftRoleFollower
     rf.curTerm = reply.FollowTerm
     rf.LOG.Printf("::SendAppendEntries(TO %v) Encounter greater term: Leader => %v with term %v", server, rf.role, rf.curTerm)
@@ -139,18 +133,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
   // Return false if lock busy
   rf.refreshTimeOut()
-  if !rf.statMu.TryLock() {
-    return
-  }
-  // defer rf.statMu.Unlock()
-
   // Return false if term dismatch
+  rf.statMu.RLock()
   reply.FollowTerm = rf.curTerm
-  if args.LeaderTerm < rf.curTerm {
+  rf.statMu.RUnlock()
+  if args.LeaderTerm < reply.FollowTerm {
     rf.LOG.Printf("+::AppendEntries Raft-%v should convert to follower", args.LeaderId)//. Term dismatch follower %v, leader %v", rf.curTerm, args.LeaderTerm)
-    rf.statMu.Unlock()
     return
   }
+  rf.statMu.Lock() 
   rf.role = RaftRoleFollower
   rf.curTerm = args.LeaderTerm
   // Just heartbeat, doesn't append any log

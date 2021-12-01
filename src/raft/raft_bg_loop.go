@@ -6,9 +6,9 @@ import (
 
 func (rf *Raft) appendLoop() {
   for !rf.killed() {
-    rf.statMu.Lock()
+    rf.statMu.RLock()
     curRole := rf.role
-    rf.statMu.Unlock()
+    rf.statMu.RUnlock()
     if curRole != RaftRoleLeader {
       time.Sleep(50 * time.Millisecond)
       continue
@@ -77,9 +77,9 @@ func (rf *Raft) commitLoop() {
     index := rf.nextIndex[mid]
     entry := rf.logEntries[index - 1]
     rf.entriesMu.Unlock()
-    rf.statMu.Lock()
+    rf.statMu.RLock()
     curTerm := rf.curTerm
-    rf.statMu.Unlock()
+    rf.statMu.RUnlock()
     if entry.Term != curTerm {
       rf.LOG.Printf("Abort update commitIndex, term dismatch. Entry term %v, current term %v", entry.Term, rf.curTerm)
       time.Sleep(500 * time.Millisecond)

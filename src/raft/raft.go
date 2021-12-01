@@ -105,7 +105,7 @@ type Raft struct {
   lastApplyMu		*ChanMutex // protect lastApplied
   lastApplied   LogIndex   // index of the highest log entry applied to state machine
 
-  statMu        *ChanMutex // protect curTerm, voteFor, role
+  statMu        *sync.RWMutex// protect curTerm, voteFor, role
   curTerm       Term
   voteFor       RaftId
   role          RaftRole
@@ -135,8 +135,8 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
   // Your code here (2A).
-  rf.statMu.Lock()
-  defer rf.statMu.Unlock()
+  rf.statMu.RLock()
+  defer rf.statMu.RUnlock()
   return int(rf.curTerm), rf.role == RaftRoleLeader
 }
 
@@ -217,13 +217,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
   term := -1
   isLeader := true
   // Your code here (2B).
-  rf.statMu.Lock()
+  rf.statMu.RLock()
   if rf.role != RaftRoleLeader {
-    rf.statMu.Unlock()
+    rf.statMu.RUnlock()
     rf.LOG.Printf("Warn, I am not leader, I am follower %v", rf.me)
     return index, term, false
   }
-  rf.statMu.Unlock()
+  rf.statMu.RUnlock()
 
   rf.curLogMu.Lock()
   defer rf.curLogMu.Unlock()
@@ -335,20 +335,25 @@ func (rf *Raft) InCandidate() {
     }
   }
 
-  rf.statMu.Lock()
-  defer rf.statMu.Unlock()
-  if rf.curTerm != oldTerm + 1 {
+  rf.statMu.RLock()
+  curTerm := rf.curTerm
+  rf.statMu.RUnlock()
+  if curTerm != oldTerm + 1 {
     rf.LOG.Printf("Abort election, term %v", rf.curTerm)
     return
   }
   if granted < majority {
+    rf.statMu.Lock()
+    defer rf.statMu.Unlock()
     rf.LOG.Printf("Lose election, %v votes", granted)
     rf.role = RaftRoleFollower
     rf.voteFor = InvalidRaftId
     return
   }
   rf.LOG.Printf("Win election, %v votes. Convert from %v to Leader", granted, rf.role)
+  rf.statMu.Lock()
   rf.role = RaftRoleLeader
+  rf.statMu.Unlock()
 
   // After just as leader
   rf.InitNextIndex()
@@ -360,9 +365,9 @@ func (rf *Raft) InCandidate() {
 }
 
 func (rf *Raft) InLeader() {
-  rf.statMu.Lock()
+  rf.statMu.RLock()
   curTerm := rf.curTerm
-  rf.statMu.Unlock()
+  rf.statMu.RUnlock()
   ch := make(chan *AppendEntriesReply)
   count := len(rf.peers)
   for peer := range rf.peers {
@@ -373,7 +378,9 @@ func (rf *Raft) InLeader() {
     var entry         LogEntry
     var prevLogIndex  LogIndex
     var prevLogTerm   Term
+    rf.nextIdxMu.Lock()
     nextLogIndex = rf.nextIndex[peer]
+    rf.nextIdxMu.Unlock()
     prevLogIndex = nextLogIndex - 1
     prevLogTerm = rf.logEntries[prevLogIndex].Term
 
@@ -428,11 +435,11 @@ func (rf *Raft) String() string {
 
 func (rf *Raft) InitNextIndex() {
   rf.nextIdxMu.Lock()
+  defer rf.nextIdxMu.Unlock()
   rf.curLogMu.Lock()
   curLogIndex := rf.curLogIndex
   rf.curLogMu.Unlock()
-  defer rf.nextIdxMu.Unlock()
-  for i := range rf.nextIndex {
+   for i := range rf.nextIndex {
     rf.nextIndex[i] = curLogIndex + 1
   }
   rf.LOG.Printf("Init next index %v", curLogIndex + 1)
@@ -454,6 +461,16 @@ func (rf *Raft) AppendLogEntry(entry *LogEntry) {
   }
   rf.logEntries = append(rf.logEntries, entry)
   rf.LOG.Printf("Appended entry to leader : %v", entry)
+}
+
+func (rf *Raft) GetRaftStat() (Term, RaftRole, RaftId)  {
+  rf.statMu.RLock()
+  defer rf.statMu.RUnlock()
+  return rf.curTerm, rf.role, rf.voteFor
+}
+
+func (rf *Raft) SetRaftStat(newTerm Term, newRole RaftRole, voteFor RaftId) {
+  
 }
 
 //
@@ -485,7 +502,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
     commitIndex:  InvalidLogIndex,
     lastApplyMu:  NewChanMutex(),
     lastApplied: 	1,
-    statMu:       NewChanMutex(),
+    statMu:       &sync.RWMutex{},
     curTerm:      0,
     voteFor:      InvalidRaftId,
     role:         RaftRoleFollower,
