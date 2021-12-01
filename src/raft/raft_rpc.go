@@ -55,9 +55,8 @@ func (rf *Raft) ChanRequestVote(ch chan *RequestVoteReply, server int, args *Req
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
   // Your code here (2A, 2B).
   // Condition 1: Term dismatch OR log index dismatch
-  rf.statMu.RLock()
-  reply.VoterTerm = rf.curTerm
-  rf.statMu.RUnlock()
+  curTerm, _, _ := rf.SyncGetRaftStat()
+  reply.VoterTerm = curTerm
   reply.VoterId = rf.id
   reply.VoteGranted = false
   
@@ -72,15 +71,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
   // Condition 2: Vote
   rf.refreshTimeOut()
+
   rf.statMu.Lock()
   defer rf.statMu.Unlock()
+  oldTerm := rf.curTerm
+
   rf.voteFor = args.CandidateId
-  old := rf.curTerm
   rf.curTerm = args.CandidateTerm
   rf.role = RaftRoleFollower
+
   reply.VoteGranted = true
-  reply.VoterTerm = old
-  rf.LOG.Printf("> Vote for %v, term %v => %v", rf.voteFor, old, rf.curTerm)
+  reply.VoterTerm = rf.curTerm
+  rf.LOG.Printf("> Vote for %v, term %v => %v", args.CandidateId, oldTerm, rf.curTerm)
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
@@ -95,9 +97,7 @@ func (rf *Raft) ChanSendAppendEntries(ch chan *AppendEntriesReply, server int, a
     rf.LOG.Printf("::SendAppendEntires(TO %v) Fail with network error", reply.FollowId)
     return
   }
-  rf.statMu.RLock()
-  curTerm := rf.curTerm
-  rf.statMu.RUnlock()
+  curTerm, _, _ := rf.SyncGetRaftStat()
   if reply.FollowTerm > curTerm {
     rf.statMu.Lock()
     defer rf.statMu.Unlock()
@@ -134,9 +134,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
   // Return false if lock busy
   rf.refreshTimeOut()
   // Return false if term dismatch
-  rf.statMu.RLock()
-  reply.FollowTerm = rf.curTerm
-  rf.statMu.RUnlock()
+  curTerm, _, _ := rf.SyncGetRaftStat()
+  reply.FollowTerm = curTerm
   if args.LeaderTerm < reply.FollowTerm {
     rf.LOG.Printf("+::AppendEntries Raft-%v should convert to follower", args.LeaderId)//. Term dismatch follower %v, leader %v", rf.curTerm, args.LeaderTerm)
     return
@@ -170,14 +169,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
   rf.logEntries = rf.logEntries[:args.Entry.Index - 1]
   rf.AppendLogEntry(&args.Entry)
   rf.LOG.Printf("+::AppendEntries append new entry. Term %v - index %v", args.Entry.Term, args.Entry.Index)
-
-  rf.commitIdxMu.Lock()
-  defer rf.commitIdxMu.Unlock()
-  oldCommitIndex := rf.commitIndex
+ 
+  var oldCommitIndex LogIndex
+  var newCommitIndex LogIndex
   if args.LeaderCommit > args.Entry.Index {
-    rf.commitIndex = args.Entry.Index
+    newCommitIndex = args.Entry.Index
   } else {
-    rf.commitIndex = args.LeaderCommit
+    newCommitIndex = args.LeaderCommit
   }
-  rf.LOG.Printf("_::AppendEntries update commitIndex from %v to %v", oldCommitIndex, rf.commitIndex)
+  oldCommitIndex = rf.SyncSetCommitIndex(newCommitIndex)
+
+  rf.LOG.Printf("_::AppendEntries update commitIndex from %v to %v", oldCommitIndex, newCommitIndex)
 }

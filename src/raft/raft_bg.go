@@ -6,9 +6,7 @@ import (
 
 func (rf *Raft) appendLoop() {
   for !rf.killed() {
-    rf.statMu.RLock()
-    curRole := rf.role
-    rf.statMu.RUnlock()
+    _, curRole, _ := rf.SyncGetRaftStat()
     if curRole != RaftRoleLeader {
       time.Sleep(50 * time.Millisecond)
       continue
@@ -48,9 +46,7 @@ func (rf *Raft) electLoop() {
 
 func (rf *Raft) applyLoop() {
   for {
-    rf.commitIdxMu.Lock()
-    commitIndex := rf.commitIndex
-    rf.commitIdxMu.Unlock()
+    commitIndex := rf.SyncGetCommitIndex()
     rf.lastApplyMu.Lock()
     for commitIndex > rf.lastApplied {
       rf.lastApplied++
@@ -65,35 +61,42 @@ func (rf *Raft) applyLoop() {
 
 func (rf *Raft) commitLoop() {
   for {
-    rf.nextIdxMu.Lock()
-    nextIndex := make([]LogIndex, len(rf.nextIndex))
-    copy(nextIndex, rf.nextIndex) 
-    rf.nextIdxMu.Unlock()
-    sort.Slice(nextIndex, func(i, j int) bool {
-      return nextIndex[i] < nextIndex[j]
+    // 1. Get snapshot of macthIndex (matchIndex increases monotonically)
+    rf.matchIdxMu.RLock()
+    peersNum := len(rf.peers)
+    macthIndex := make([]LogIndex, peersNum)
+    copy(macthIndex, rf.matchIndex) 
+    rf.matchIdxMu.RUnlock()
+
+    // 2. Sort the snapshot
+    sort.Slice(macthIndex, func(i, j int) bool {
+      return macthIndex[i] < macthIndex[j]
     })
-    mid := len(nextIndex)/2
-    rf.entriesMu.Lock()
-    index := rf.nextIndex[mid]
-    entry := rf.logEntries[index - 1]
-    rf.entriesMu.Unlock()
-    rf.statMu.RLock()
-    curTerm := rf.curTerm
-    rf.statMu.RUnlock()
+
+    // 3. Find the N that marjority of server got replicated it
+    mid := peersNum/2
+    rf.matchIdxMu.RLock()
+    index := rf.matchIndex[mid]
+    rf.matchIdxMu.RUnlock() 
+
+    entry := rf.SyncGetLogEntry(index)
+
+    // 4. Set commitIndex = N
+    curTerm, _, _ := rf.SyncGetRaftStat()
     if entry.Term != curTerm {
       rf.LOG.Printf("Abort update commitIndex, term dismatch. Entry term %v, current term %v", entry.Term, rf.curTerm)
       time.Sleep(500 * time.Millisecond)
       continue
     }
-    rf.commitIdxMu.Lock()
-    if rf.commitIndex >= entry.Index {
+
+    if rf.SyncGetCommitIndex() >= entry.Index {
       time.Sleep(500 * time.Millisecond)
-      rf.commitIdxMu.Unlock()
       continue
     }
-    rf.LOG.Printf("Update commitIndex from %v to %v", rf.commitIndex, nextIndex[mid])
-    rf.commitIndex = nextIndex[mid]
-    rf.commitIdxMu.Unlock()
+
+    rf.LOG.Printf("Update commitIndex from %v to %v", rf.commitIndex, entry.Index)
+    rf.SyncSetCommitIndex(entry.Index)
+
     time.Sleep(500 * time.Millisecond)
   }
 }

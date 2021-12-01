@@ -96,13 +96,13 @@ type Raft struct {
   id RaftId
 
   // The top log index
-  curLogMu      *ChanMutex // protect curLogIndex and curLogTerm
+  curLogMu      *sync.RWMutex // protect curLogIndex and curLogTerm
   curLogIndex   LogIndex
   curLogTerm    Term
 
-  commitIdxMu   *ChanMutex // protect commitIndex
+  commitIdxMu   *sync.RWMutex // protect commitIndex
   commitIndex   LogIndex   // index of the highest log entry known to be committed
-  lastApplyMu		*ChanMutex // protect lastApplied
+  lastApplyMu		*sync.RWMutex // protect lastApplied
   lastApplied   LogIndex   // index of the highest log entry applied to state machine
 
   statMu        *sync.RWMutex// protect curTerm, voteFor, role
@@ -110,7 +110,7 @@ type Raft struct {
   voteFor       RaftId
   role          RaftRole
 
-  tickMu        *sync.Mutex
+  tickMu        *sync.RWMutex
   lastTimeOut   time.Duration // Nanosecond
   lastTickTime  time.Duration // AppendEntries write <=> Election timer read
 
@@ -122,12 +122,12 @@ type Raft struct {
 
   applyCh chan  ApplyMsg
 
-  nextIdxMu     *ChanMutex
+  nextIdxMu     *sync.RWMutex
   nextIndex     []LogIndex // What the log entry index the leader are supposed to send to follower.
-  matchIdxMu    *ChanMutex
+  matchIdxMu    *sync.RWMutex
   matchIndex    []LogIndex // Each follower's highest log entry index that replicated.
 
-  entriesMu     *ChanMutex
+  logEntriesMu  *sync.RWMutex
   logEntries		[]*LogEntry
 }
 
@@ -135,9 +135,8 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
   // Your code here (2A).
-  rf.statMu.RLock()
-  defer rf.statMu.RUnlock()
-  return int(rf.curTerm), rf.role == RaftRoleLeader
+  term, role, _ := rf.SyncGetRaftStat()
+  return int(term), role == RaftRoleLeader
 }
 
 //
@@ -217,13 +216,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
   term := -1
   isLeader := true
   // Your code here (2B).
-  rf.statMu.RLock()
-  if rf.role != RaftRoleLeader {
-    rf.statMu.RUnlock()
+  _, role, _ := rf.SyncGetRaftStat()
+  if role != RaftRoleLeader {
     rf.LOG.Printf("Warn, I am not leader, I am follower %v", rf.me)
     return index, term, false
   }
-  rf.statMu.RUnlock()
 
   rf.curLogMu.Lock()
   defer rf.curLogMu.Unlock()
@@ -261,216 +258,19 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) tickTimeOut() time.Duration {
-  rf.tickMu.Lock()
-  defer rf.tickMu.Unlock()
+  rf.tickMu.RLock()
+  defer rf.tickMu.RUnlock()
   return rf.lastTickTime + rf.lastTimeOut - time.Duration(time.Now().UnixNano())
 }
 
 func (rf *Raft) refreshTimeOut() {
+  now := time.Duration(time.Now().UnixNano())
+  last := (time.Duration)(rand.Intn(100))%15*time.Millisecond*10 + BaseElectionTimeOut
   rf.tickMu.Lock()
-  defer rf.tickMu.Unlock()
-  rf.lastTickTime = time.Duration(time.Now().UnixNano())
-  rf.lastTimeOut = (time.Duration)(rand.Intn(100))%15*time.Millisecond*10 + BaseElectionTimeOut
-  rf.LOG.Printf("Refresh time out from %v, after %v", rf.lastTickTime, rf.lastTimeOut)
-
-}
-
-func (rf *Raft) InCandidate() {
-  rf.LOG.Println("+ New election")
-  // 1.Refresh election timer
-  rf.refreshTimeOut()
-
-  rf.statMu.Lock()
-  // 2.Convert to condidate
-  rf.role = RaftRoleCandidate
-  // 3.Increment oldTerm
-  oldTerm := rf.curTerm
-  rf.curTerm = oldTerm + 1
-  newTerm := rf.curTerm
-  rf.LOG.Printf("Increment curTerm from %v to %v", oldTerm, rf.curTerm)
-  // 4.Vote for itself
-  rf.voteFor = RaftId(rf.me)
-  rf.statMu.Unlock()
-
-  // 5.Send RPC
-  args := RequestVoteArgs{
-    CandidateTerm:         newTerm,
-    CandidateId:           rf.id,
-    CandidateLastLogIndex: rf.curLogIndex,
-    CandidateLastLogTerm:  rf.curLogTerm}
-  ch := make(chan *RequestVoteReply)
-  count := 0
-  for peer := range rf.peers {
-    if peer == rf.me {
-      continue
-    }
-    reply := RequestVoteReply{
-      VoterTerm:   InvalidRaftTerm,
-      VoterId:     RaftId(peer),
-      VoteGranted: false}
-    count++
-    rf.LOG.Printf("ChRequestVote to %v", peer)
-    go rf.ChanRequestVote(ch, peer, &args, &reply)
-  }
-  majority := count/2 + 1
-  granted := 1
-  for reply := range ch {
-    count--
-    if reply.VoteGranted {
-      granted++
-      rf.LOG.Printf("< Raft-%v granted with term %v", reply.VoterId, reply.VoterTerm)
-    } else {
-      rf.LOG.Printf("< Raft-%v rejected with term %v", reply.VoterId, reply.VoterTerm)
-    }
-    // If received majority of peers' granted vote. Not wait within the loop anymore.
-    if granted >= majority {
-      rf.LOG.Println("Recevied majortiy peers' grant. Break loop")
-      break
-    }
-    // If received all votes
-    if count == 0 {
-      close(ch)
-      rf.LOG.Printf("Received all peers' vote. Close channel")
-      break
-    }
-  }
-
-  rf.statMu.RLock()
-  curTerm := rf.curTerm
-  rf.statMu.RUnlock()
-  if curTerm != oldTerm + 1 {
-    rf.LOG.Printf("Abort election, term %v", rf.curTerm)
-    return
-  }
-  if granted < majority {
-    rf.statMu.Lock()
-    defer rf.statMu.Unlock()
-    rf.LOG.Printf("Lose election, %v votes", granted)
-    rf.role = RaftRoleFollower
-    rf.voteFor = InvalidRaftId
-    return
-  }
-  rf.LOG.Printf("Win election, %v votes. Convert from %v to Leader", granted, rf.role)
-  rf.statMu.Lock()
-  rf.role = RaftRoleLeader
-  rf.statMu.Unlock()
-
-  // After just as leader
-  rf.InitNextIndex()
-  newLogIndex := rf.curLogIndex + 1
-  noOp := &LogEntry{ Term: rf.curTerm, Index: newLogIndex, Command: "NoOperation"}
-  rf.commitCh <- noOp
-  rf.curLogIndex = newLogIndex
-  rf.LOG.Printf("Submit a noOp after winning election")
-}
-
-func (rf *Raft) InLeader() {
-  rf.statMu.RLock()
-  curTerm := rf.curTerm
-  rf.statMu.RUnlock()
-  ch := make(chan *AppendEntriesReply)
-  count := len(rf.peers)
-  for peer := range rf.peers {
-    if peer == rf.me {
-      continue
-    }
-    var nextLogIndex  LogIndex
-    var entry         LogEntry
-    var prevLogIndex  LogIndex
-    var prevLogTerm   Term
-    rf.nextIdxMu.Lock()
-    nextLogIndex = rf.nextIndex[peer]
-    rf.nextIdxMu.Unlock()
-    prevLogIndex = nextLogIndex - 1
-    prevLogTerm = rf.logEntries[prevLogIndex].Term
-
-    if nextLogIndex == LogIndex(len(rf.logEntries)) {
-      entry = LogEntry{Term: curTerm, Index: InvalidLogIndex, Command: nil}
-    } else {
-      entry = *rf.logEntries[nextLogIndex]
-    }
-    args := AppendEntriesArgs{
-      LeaderTerm:     curTerm,
-      LeaderId:       rf.id,
-      PrevLogIndex:   prevLogIndex,
-      PrevLogTerm:    prevLogTerm,
-      Entry:      	  entry,
-      LeaderCommit:   rf.commitIndex}
-    reply := AppendEntriesReply{}
-    go rf.ChanSendAppendEntries(ch, peer, &args, &reply)
-  }
-  majority := count/2 + 1
-  received := 1
-  for range ch {
-    count--
-    received++
-    if received >= majority {
-      rf.LOG.Printf("Continue be Leader, received %v/%v append reply", received, len(rf.peers))
-      break
-    }
-    if count == 0 {
-      close(ch)
-      rf.LOG.Printf("Close append channel")
-      break
-    }
-  }
-  if received >= majority {
-    rf.refreshTimeOut()
-    return
-  }
-
-  rf.statMu.Lock()
-  defer rf.statMu.Unlock()
-  if rf.role == RaftRoleLeader && rf.curTerm == curTerm {
-    rf.role = RaftRoleFollower
-    rf.LOG.Printf("Leader => Follower, not receive enought append reply")
-  }
-}
-
-func (rf *Raft) String() string {
-  return fmt.Sprintf(
-    "id %v, curLogIndex: %v, curLogTerm %v, commitIndex %v, lastApplied %v, curTerm %v, voteFor %v, role %v, lastTimeOut %v, lastTickTime %v",
-    rf.id, rf.curLogIndex, rf.curLogTerm, rf.commitIndex, rf.lastApplied, rf.curTerm, rf.voteFor, rf.role, rf.lastTimeOut, rf.lastTickTime)
-}
-
-func (rf *Raft) InitNextIndex() {
-  rf.nextIdxMu.Lock()
-  defer rf.nextIdxMu.Unlock()
-  rf.curLogMu.Lock()
-  curLogIndex := rf.curLogIndex
-  rf.curLogMu.Unlock()
-   for i := range rf.nextIndex {
-    rf.nextIndex[i] = curLogIndex + 1
-  }
-  rf.LOG.Printf("Init next index %v", curLogIndex + 1)
-}
-
-func (rf *Raft) AppendLogEntry(entry *LogEntry) {
-  idx := entry.Index
-  rf.entriesMu.Lock()
-  defer rf.entriesMu.Unlock()
-  if int(idx) != len(rf.logEntries) {
-    rf.LOG.Fatalf("Log entres length %v dismatch log index %v", len(rf.logEntries), idx)
-    return
-  }
-  if int(idx) == cap(rf.logEntries) {
-    newLogEntries := make([]*LogEntry, cap(rf.logEntries) * 2)
-     copy(newLogEntries, rf.logEntries)
-     rf.logEntries = newLogEntries
-     rf.LOG.Printf("Expand logEntries capacity to %v", cap(rf.logEntries))
-  }
-  rf.logEntries = append(rf.logEntries, entry)
-  rf.LOG.Printf("Appended entry to leader : %v", entry)
-}
-
-func (rf *Raft) GetRaftStat() (Term, RaftRole, RaftId)  {
-  rf.statMu.RLock()
-  defer rf.statMu.RUnlock()
-  return rf.curTerm, rf.role, rf.voteFor
-}
-
-func (rf *Raft) SetRaftStat(newTerm Term, newRole RaftRole, voteFor RaftId) {
-  
+  rf.lastTickTime = time.Duration(now)
+  rf.lastTimeOut = last
+  rf.tickMu.Unlock()
+  rf.LOG.Printf("Refresh time out from %v, after %v", now, last)
 }
 
 //
@@ -495,26 +295,26 @@ func Make(peers []*labrpc.ClientEnd, me int,
     persister: 		persister,
     me: 					me,
     id:           RaftId(me),
-    curLogMu:     NewChanMutex(),
+    curLogMu:     &sync.RWMutex{},
     curLogIndex:  InvalidLogIndex,
     curLogTerm:   0,
-    commitIdxMu: 	NewChanMutex(),
+    commitIdxMu: 	&sync.RWMutex{},
     commitIndex:  InvalidLogIndex,
-    lastApplyMu:  NewChanMutex(),
-    lastApplied: 	1,
+    lastApplyMu:  &sync.RWMutex{},
+    lastApplied: 	0,
     statMu:       &sync.RWMutex{},
     curTerm:      0,
     voteFor:      InvalidRaftId,
     role:         RaftRoleFollower,
-    tickMu:       &sync.Mutex{},
+    tickMu:       &sync.RWMutex{},
     applyCh:      applyCh,
     commitCh:     make(chan *LogEntry),
     persisCh:     make(chan *LogEntry),
     nextIndex:    make([]LogIndex, len(peers)),
-    nextIdxMu:    NewChanMutex(),
+    nextIdxMu:    &sync.RWMutex{},
     matchIndex:   make([]LogIndex, len(peers)),
-    matchIdxMu:   NewChanMutex(),
-    entriesMu:    NewChanMutex(),
+    matchIdxMu:   &sync.RWMutex{},
+    logEntriesMu: &sync.RWMutex{},
     logEntries:   make([]*LogEntry, 0, 128),
     LOG:          log.New(os.Stdout, fmt.Sprintf("Raft-%v ", me), log.Ltime|log.Lshortfile)}
 
