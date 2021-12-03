@@ -1,8 +1,5 @@
 package raft
 
-import (
-)
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -11,8 +8,8 @@ type RequestVoteArgs struct {
   // Your data here (2A, 2B).
   CandidateTerm         Term
   CandidateId           RaftId
-  CandidateLastLogIndex LogIndex
-  CandidateLastLogTerm  Term
+  LastCommittedLogIndex LogIndex
+  LastCommittedLogTerm  Term
 }
 
 //
@@ -27,18 +24,18 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-  LeaderTerm    Term
-  LeaderId      RaftId
-  PrevLogIndex  LogIndex // immediately preceding new one (Entry field below)
-  PrevLogTerm   Term     // immediately preceding new one (Entry field below)
-  Entry         LogEntry // The new entry for the follower
-  LeaderCommit  LogIndex // Leader's commit index
+  LeaderTerm   Term
+  LeaderId     RaftId
+  PrevLogIndex LogIndex // immediately preceding new one (Entry field below)
+  PrevLogTerm  Term     // immediately preceding new one (Entry field below)
+  Entry        LogEntry // The new entry for the follower
+  LeaderCommit LogIndex // Leader's commit index
 }
 
 type AppendEntriesReply struct {
-  FollowId    RaftId
-  FollowTerm  Term
-  Success     bool
+  FollowId   RaftId
+  FollowTerm Term
+  Success    bool
 }
 
 func (rf *Raft) ChanRequestVote(ch chan *RequestVoteReply, server int, args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -56,16 +53,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
   // Your code here (2A, 2B).
   // Condition 1: Term dismatch OR log index dismatch
   curTerm, _, _ := rf.SyncGetRaftStat()
+  commitIndex := rf.SyncGetCommitIndex()
+  commitTerm := rf.SyncGetLogEntry(commitIndex).Term
   reply.VoterTerm = curTerm
   reply.VoterId = rf.id
   reply.VoteGranted = false
-  
+
   if args.CandidateTerm <= reply.VoterTerm {
-    rf.LOG.Printf("> Reject vote candidate %v, term %v left behind me %v", args.CandidateId, args.CandidateTerm, rf.curTerm)
+    rf.LOG.Printf("> Reject vote candidate %v, term %v left behind me %v", args.CandidateId, args.CandidateTerm, reply.VoterTerm)
     return
   }
-  if args.CandidateLastLogIndex < rf.curLogIndex {
-    rf.LOG.Printf("> Reject vote candidate %v, log-index %v left behind of %v", args.CandidateId, args.CandidateLastLogIndex, rf.curLogIndex)
+  rf.LOG.Printf("🟢 candidate LastCommittedLogIndex(%v) / my commitIndex(%v), LastCommittedLogTerm(%v) / commitTerm(%v)", args.LastCommittedLogIndex, commitIndex, args.LastCommittedLogTerm, commitTerm)
+  if args.LastCommittedLogIndex < commitIndex && args.LastCommittedLogTerm <= commitTerm {
+    rf.LOG.Printf("> Reject vote candidate %v, candidate last committed entry term(%v) index(%v). My term(%v) index(%v)", args.CandidateId, args.LastCommittedLogIndex, args.LastCommittedLogTerm, commitTerm, commitIndex)
     return
   }
 
@@ -92,7 +92,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) ChanSendAppendEntries(ch chan *AppendEntriesReply, server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
   ok := rf.sendAppendEntries(server, args, reply)
-  ch <- reply
+  if ch != nil {
+    ch <- reply
+  }
   if !ok {
     rf.LOG.Printf("::SendAppendEntires(TO %v) Fail with network error", reply.FollowId)
     return
@@ -107,17 +109,21 @@ func (rf *Raft) ChanSendAppendEntries(ch chan *AppendEntriesReply, server int, a
     return
   }
 
+  rf.nextIdxMu.Lock()
+  defer rf.nextIdxMu.Unlock()
+  rf.matchIdxMu.Lock()
+  defer rf.matchIdxMu.Unlock()
   if reply.Success {
-    if args.Entry.Index == InvalidLogIndex {
-      rf.LOG.Printf("::SendAppendEntries(TO %v) Ok. As heartbeat.", server)
+    if args.Entry.Command == CommandHeartbeat {
+      //rf.LOG.Printf("::SendAppendEntries(TO %v) Success. Heartbeat command. Entry %v", server, args.Entry)
       return
     }
-    rf.nextIndex[server] = rf.nextIndex[server] + 1
-    rf.matchIndex[server] = rf.nextIndex[server] - 1
-    rf.LOG.Printf("::SendAppendEntries(TO %v) Ok. Now match %v, next %v", server, rf.matchIndex[server], rf.nextIndex[server])
+    rf.nextIndex[server] = args.Entry.Index + 1
+    rf.matchIndex[server] = args.Entry.Index
+    rf.LOG.Printf("::SendAppendEntries(TO %v) Success. Now match %v, next %v", server, rf.matchIndex[server], rf.nextIndex[server])
     return
   }
-  rf.nextIndex[server] = rf.nextIndex[server] - 1
+  rf.nextIndex[server] = LogIndex(Max(1, int(args.Entry.Index) - 1))
   rf.matchIndex[server] = 0
   rf.LOG.Printf("::SendAppendEntries(TO %v) Fail. Now match %v, next %v", server, rf.matchIndex[server], rf.nextIndex[server])
 }
@@ -131,53 +137,63 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
   reply.Success = false
   reply.FollowId = rf.id
 
-  // Return false if lock busy
   rf.refreshTimeOut()
-  // Return false if term dismatch
+  // Wrong leader, if term dismatch
   curTerm, _, _ := rf.SyncGetRaftStat()
   reply.FollowTerm = curTerm
   if args.LeaderTerm < reply.FollowTerm {
-    rf.LOG.Printf("+::AppendEntries Raft-%v should convert to follower", args.LeaderId)//. Term dismatch follower %v, leader %v", rf.curTerm, args.LeaderTerm)
-    return
-  }
-  rf.statMu.Lock() 
-  rf.role = RaftRoleFollower
-  rf.curTerm = args.LeaderTerm
-  // Just heartbeat, doesn't append any log
-  if args.Entry.Index == InvalidLogIndex {
-    reply.Success = true
-    rf.LOG.Printf("+::AppendEntries as heartbeat")
-    rf.statMu.Unlock()
-    return
-  } 
-  rf.statMu.Unlock()
-  // Prev log dismatch
-  if rf.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
-    reply.Success = false
-    rf.logEntries = rf.logEntries[:args.PrevLogIndex - 1]
-    rf.LOG.Printf("+::AppendEntries delete all log from index %v", args.PrevLogIndex - 1)
+    rf.LOG.Printf("+::AppendEntries Raft-%v should convert to follower", args.LeaderId) //. Term dismatch follower %v, leader %v", rf.curTerm, args.LeaderTerm)
     return
   }
 
-  // Entry already exists
-  reply.Success = true
-  if rf.logEntries[args.Entry.Index].Term == args.Entry.Term {
-    rf.LOG.Printf("+::AppendEntries append entry already exists. Term %v - index %v", args.Entry.Term, args.Entry.Index)
-    return
-  }
-  // Entry not exists
-  rf.logEntries = rf.logEntries[:args.Entry.Index - 1]
-  rf.AppendLogEntry(&args.Entry)
-  rf.LOG.Printf("+::AppendEntries append new entry. Term %v - index %v", args.Entry.Term, args.Entry.Index)
- 
+  // Legal Leader. Heartbeat.
   var oldCommitIndex LogIndex
   var newCommitIndex LogIndex
-  if args.LeaderCommit > args.Entry.Index {
+  if args.LeaderCommit > args.Entry.Index && args.Entry.Index != LogIndexInitial {
     newCommitIndex = args.Entry.Index
   } else {
     newCommitIndex = args.LeaderCommit
   }
   oldCommitIndex = rf.SyncSetCommitIndex(newCommitIndex)
+  rf.LOG.Printf("__::AppendEntries rf.commitIndex %v -> min(leaderCommit %v, entry.Index %v)", oldCommitIndex, args.LeaderCommit, args.Entry.Index)
 
-  rf.LOG.Printf("_::AppendEntries update commitIndex from %v to %v", oldCommitIndex, newCommitIndex)
+  rf.statMu.Lock()
+  rf.role = RaftRoleFollower
+  rf.curTerm = args.LeaderTerm
+  if args.Entry.Command == CommandHeartbeat {
+    reply.Success = true
+    //rf.LOG.Printf("+::AppendEntries as heartbeat")
+    rf.statMu.Unlock()
+    return
+  }
+  rf.statMu.Unlock()
+
+  rf.logEntriesMu.Lock()
+  rf.curLogMu.Lock()
+  defer rf.curLogMu.Unlock()
+  defer rf.logEntriesMu.Unlock()
+  // Legal leader. Append entry.
+  // Prev log not exist
+  if len(rf.logEntries) <= int(args.PrevLogIndex) {
+    reply.Success = false
+    rf.LOG.Printf("+::AppendEntries not exits PrevLogIndex %v, len(rf.logEntries) = %v", args.PrevLogIndex, len(rf.logEntries))
+    return
+  }
+  // Prev log dismatch
+  if rf.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
+    reply.Success = false
+    rf.logEntries = rf.logEntries[:args.PrevLogIndex]
+    rf.LOG.Printf("+::AppendEntries delete all log from index %v", args.PrevLogIndex)
+    return
+  }
+  // Entry already exists, index and term match.
+  reply.Success = true
+  if len(rf.logEntries) == int(args.Entry.Index) + 1 && rf.logEntries[args.Entry.Index].Term == args.Entry.Term {
+    rf.LOG.Printf("+::AppendEntries append entry already exists. Entry %v", args.Entry)
+    return
+  }
+  // Entry supposed to be add.
+  rf.LOG.Printf("+::AppendEntries append --")
+  reply.Success = true
+  rf.appendOldEntry(&args.Entry)
 }

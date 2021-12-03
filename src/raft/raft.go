@@ -18,17 +18,17 @@ package raft
 //
 
 import (
-	//  "bytes"
-	"fmt"
-	"log"
-	"math/rand"
-	"os"
-	"sync"
-	"sync/atomic"
-	"time"
+  //  "bytes"
+  "fmt"
+  "log"
+  "math/rand"
+  "os"
+  "sync"
+  "sync/atomic"
+  "time"
 
-	//  "6.824/labgob"
-	"6.824/labrpc"
+  //  "6.824/labgob"
+  "6.824/labrpc"
 )
 
 //
@@ -60,6 +60,10 @@ type LogEntry struct {
   Command interface{}
 }
 
+func (le *LogEntry) String() string {
+  return fmt.Sprintf("(Term %v, Index %v, Command '%v')", le.Term, le.Index, le.Command)
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -67,20 +71,6 @@ type Term int64
 type RaftId int64
 type LogIndex uint64
 type RaftRole string
-
-const (
-  RaftRoleLeader    RaftRole = "Leader"
-  RaftRoleCandidate RaftRole = "Candidate"
-  RaftRoleFollower  RaftRole = "Follower"
-)
-
-const InvalidRaftId 	RaftId = -1
-const InvalidRaftTerm Term = -1
-const InvalidLogIndex	LogIndex = 0
-
-// Base election time out.
-// From paper, 150ms - 300ms. Ref to 5.6 Timing and availability
-const BaseElectionTimeOut time.Duration = time.Millisecond * 100
 
 type Raft struct {
   mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -96,39 +86,39 @@ type Raft struct {
   id RaftId
 
   // The top log index
-  curLogMu      *sync.RWMutex // protect curLogIndex and curLogTerm
-  curLogIndex   LogIndex
-  curLogTerm    Term
+  curLogMu    *sync.RWMutex // protect curLogIndex and curLogTerm
+  curLogIndex LogIndex
+  curLogTerm  Term
 
-  commitIdxMu   *sync.RWMutex // protect commitIndex
-  commitIndex   LogIndex   // index of the highest log entry known to be committed
-  lastApplyMu		*sync.RWMutex // protect lastApplied
-  lastApplied   LogIndex   // index of the highest log entry applied to state machine
+  commitIdxMu *sync.RWMutex // protect commitIndex
+  commitIndex LogIndex      // index of the highest log entry known to be committed
+  lastApplyMu *sync.RWMutex // protect lastApplied
+  lastApplied LogIndex      // index of the highest log entry applied to state machine
 
-  statMu        *sync.RWMutex// protect curTerm, voteFor, role
-  curTerm       Term
-  voteFor       RaftId
-  role          RaftRole
+  statMu  *sync.RWMutex // protect curTerm, voteFor, role
+  curTerm Term
+  voteFor RaftId
+  role    RaftRole
 
-  tickMu        *sync.RWMutex
-  lastTimeOut   time.Duration // Nanosecond
-  lastTickTime  time.Duration // AppendEntries write <=> Election timer read
+  tickMu       *sync.RWMutex
+  lastTimeOut  time.Duration // Nanosecond
+  lastTickTime time.Duration // AppendEntries write <=> Election timer read
 
-  LOG           *log.Logger
+  LOG *log.Logger
 
   // 2B
   commitCh chan *LogEntry
   persisCh chan *LogEntry
 
-  applyCh chan  ApplyMsg
+  applyCh chan ApplyMsg
 
-  nextIdxMu     *sync.RWMutex
-  nextIndex     []LogIndex // What the log entry index the leader are supposed to send to follower.
-  matchIdxMu    *sync.RWMutex
-  matchIndex    []LogIndex // Each follower's highest log entry index that replicated.
+  nextIdxMu  *sync.RWMutex
+  nextIndex  []LogIndex // What the log entry index the leader are supposed to send to follower.
+  matchIdxMu *sync.RWMutex
+  matchIndex []LogIndex // Each follower's highest log entry index that replicated.
 
-  logEntriesMu  *sync.RWMutex
-  logEntries		[]*LogEntry
+  logEntriesMu *sync.RWMutex
+  logEntries   []*LogEntry
 }
 
 // return currentTerm and whether this server
@@ -218,21 +208,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
   // Your code here (2B).
   _, role, _ := rf.SyncGetRaftStat()
   if role != RaftRoleLeader {
-    rf.LOG.Printf("Warn, I am not leader, I am follower %v", rf.me)
+    rf.LOG.Printf("❌ Start warn. Not LEADER, but FOLLOWER %v", rf.me)
     return index, term, false
   }
-
-  rf.curLogMu.Lock()
-  defer rf.curLogMu.Unlock()
-  newLogIndex := rf.curLogIndex + 1
-  logEntryPtr := &LogEntry{Term: rf.curTerm, Index: newLogIndex, Command: command}
-  // Enqueue the log entry to channel 
-  // and background worker will going to read from the channel
-  // rf.commitCh <- logEntryPtr
-  go rf.AppendLogEntry(logEntryPtr)
-  rf.curLogIndex = logEntryPtr.Index
-  rf.curLogTerm = logEntryPtr.Term
-  rf.LOG.Printf("Ok, accept start command, end up with log index %v", rf.curLogIndex)
+  newEntry := rf.appendNewEntry(command)
+  rf.SyncSetMatchIndex(rf.id, newEntry.Index)
+  rf.LOG.Printf("Set rf.id(%v)", rf.id)
+  rf.LOG.Printf("🚗 Started entry %v", newEntry)
+  rf.curLogMu.RLock()
+  defer rf.curLogMu.RUnlock()
   return int(rf.curLogIndex), int(rf.curLogTerm), isLeader
 }
 
@@ -265,12 +249,11 @@ func (rf *Raft) tickTimeOut() time.Duration {
 
 func (rf *Raft) refreshTimeOut() {
   now := time.Duration(time.Now().UnixNano())
-  last := (time.Duration)(rand.Intn(100))%15*time.Millisecond*10 + BaseElectionTimeOut
+  last := (time.Duration)(rand.Intn(100))%15*time.Millisecond*10 + SleepElection
   rf.tickMu.Lock()
   rf.lastTickTime = time.Duration(now)
   rf.lastTimeOut = last
   rf.tickMu.Unlock()
-  rf.LOG.Printf("Refresh time out from %v, after %v", now, last)
 }
 
 //
@@ -289,22 +272,30 @@ var LOG log.Logger
 func Make(peers []*labrpc.ClientEnd, me int,
   persister *Persister, applyCh chan ApplyMsg) *Raft {
   LOG = *log.New(os.Stdout, "Raft Maker ", log.Ltime|log.Lshortfile)
+  raftLog := log.New(os.Stdout, fmt.Sprintf("Raft-%v ", me), log.Ltime|log.Lshortfile)
+  f, err := os.OpenFile(fmt.Sprintf("logs/peer-log.%v", time.Now().Unix()), os.O_RDWR | os.O_CREATE | os.O_APPEND, 0666)
+  if err != nil {
+      log.Fatalf("error opening file: %v", err)
+  }
+  defer f.Close()
+  raftLog.SetOutput(f)
+  LOG.SetOutput(f)
   rf := &Raft{
     mu:           sync.Mutex{},
-    peers: 				peers,
-    persister: 		persister,
-    me: 					me,
+    peers:        peers,
+    persister:    persister,
+    me:           me,
     id:           RaftId(me),
     curLogMu:     &sync.RWMutex{},
-    curLogIndex:  InvalidLogIndex,
-    curLogTerm:   0,
-    commitIdxMu: 	&sync.RWMutex{},
-    commitIndex:  InvalidLogIndex,
+    curLogIndex:  LogIndexInitial,
+    curLogTerm:   RaftTermInitial,
+    commitIdxMu:  &sync.RWMutex{},
+    commitIndex:  LogIndexInitial,
     lastApplyMu:  &sync.RWMutex{},
-    lastApplied: 	0,
+    lastApplied:  LogIndexInitial,
     statMu:       &sync.RWMutex{},
-    curTerm:      0,
-    voteFor:      InvalidRaftId,
+    curTerm:      RaftTermInvalid,
+    voteFor:      RaftIdInvalid,
     role:         RaftRoleFollower,
     tickMu:       &sync.RWMutex{},
     applyCh:      applyCh,
@@ -316,20 +307,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
     matchIdxMu:   &sync.RWMutex{},
     logEntriesMu: &sync.RWMutex{},
     logEntries:   make([]*LogEntry, 0, 128),
-    LOG:          log.New(os.Stdout, fmt.Sprintf("Raft-%v ", me), log.Ltime|log.Lshortfile)}
+    LOG:          raftLog}
 
   // Your initialization code here (2A, 2B, 2C).
-  rf.AppendLogEntry(&LogEntry{ Term: 0, Index: InvalidLogIndex, Command: nil})
+  rf.InitLogEntries()
   rf.InitNextIndex()
 
   // initialize from state persisted before a crash
   rf.readPersist(persister.ReadRaftState())
 
   LOG.Printf("Make Raft %v", rf)
-  go rf.appendLoop()
   go rf.electLoop()
   go rf.applyLoop()
-  go rf.commitLoop()
 
   return rf
 }

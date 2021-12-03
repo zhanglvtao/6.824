@@ -1,6 +1,6 @@
 package raft
 
-func (rf *Raft) InCandidate() {
+func (rf *Raft) election() {
   rf.LOG.Println("+ New election")
 
   rf.refreshTimeOut() // 1.Refresh election timer
@@ -14,13 +14,14 @@ func (rf *Raft) InCandidate() {
   rf.statMu.Unlock()
 
   rf.LOG.Printf("Increment curTerm from %v to %v", oldTerm, newTerm)
-
+  lastCommittedLogIndex := rf.SyncGetCommitIndex()
+  lastCommittedLogTerm := rf.SyncGetLogEntry(lastCommittedLogIndex).Term
   // 5.Send RPC
   args := RequestVoteArgs{
     CandidateTerm:         newTerm,
     CandidateId:           rf.id,
-    CandidateLastLogIndex: rf.curLogIndex,
-    CandidateLastLogTerm:  rf.curLogTerm}
+    LastCommittedLogIndex: lastCommittedLogIndex,
+    LastCommittedLogTerm:  lastCommittedLogTerm}
   ch := make(chan *RequestVoteReply)
   count := 0
   for peer := range rf.peers {
@@ -28,7 +29,7 @@ func (rf *Raft) InCandidate() {
       continue
     }
     reply := RequestVoteReply{
-      VoterTerm:   InvalidRaftTerm,
+      VoterTerm:   RaftTermInvalid,
       VoterId:     RaftId(peer),
       VoteGranted: false}
     count++
@@ -69,83 +70,26 @@ func (rf *Raft) InCandidate() {
     defer rf.statMu.Unlock()
     rf.LOG.Printf("Lose election, %v votes", granted)
     rf.role = RaftRoleFollower
-    rf.voteFor = InvalidRaftId
+    rf.voteFor = RaftIdInvalid
     return
   }
 
-  rf.LOG.Printf("Win election, %v votes. Convert from %v to Leader", granted, rf.role)
+  rf.LOG.Printf("✅ Win election, %v votes. Term %v", granted, curTerm)
 
   rf.statMu.Lock()
   rf.role = RaftRoleLeader
   rf.statMu.Unlock()
 
-  // After just as leader
+  // Reinitial rf.nextIndex[] & start commit loop
   rf.InitNextIndex()
-  newLogIndex := rf.curLogIndex + 1
-  noOp := &LogEntry{ Term: curTerm, Index: newLogIndex, Command: "NoOperation"}
-  rf.commitCh <- noOp
-  rf.curLogIndex = newLogIndex
-  rf.LOG.Printf("Submit a noOp after winning election")
-}
+  go rf.appendLoop()
+  go rf.heartbeatLoop()
+  go rf.commitLoop()
 
-func (rf *Raft) InLeader() {
-  curTerm, _, _ := rf.SyncGetRaftStat()
-  ch := make(chan *AppendEntriesReply)
-  count := len(rf.peers)
-  for peer := range rf.peers {
-    if peer == rf.me {
-      continue
-    }
-    var nextLogIndex  LogIndex
-    var entry         LogEntry
-    var prevLogIndex  LogIndex
-    var prevLogTerm   Term
-
-		nextLogIndex = rf.SyncGetNextIndex(RaftId(peer)) 
-    prevLogIndex = nextLogIndex - 1
-		prevLogTerm = rf.SyncGetLogEntry(prevLogIndex).Term
-		len, _ := rf.SyncGetLogEntryLenCap()
-
-    if nextLogIndex == LogIndex(len) {
-      entry = LogEntry{Term: curTerm, Index: InvalidLogIndex, Command: nil}
-    } else {
-			entry = rf.SyncGetLogEntry(nextLogIndex)
-    }
-    args := AppendEntriesArgs{
-      LeaderTerm:     curTerm,
-      LeaderId:       rf.id,
-      PrevLogIndex:   prevLogIndex,
-      PrevLogTerm:    prevLogTerm,
-      Entry:      	  entry,
-      LeaderCommit:   rf.commitIndex}
-    reply := AppendEntriesReply{}
-    go rf.ChanSendAppendEntries(ch, peer, &args, &reply)
+  curLogIndex, _ := rf.SyncGetCurLogIndexTerm()
+  rf.LOG.Printf("rf.curLogIndex(%v) / LogIndexInital(%v)", curLogIndex, LogIndexInitial)
+  if curLogIndex != LogIndexInitial {
+    noop := rf.appendNewEntry(CommandNoOp) 
+    rf.LOG.Printf("Submit NoopCommand after winning. Entry %v", noop)
   }
-  majority := count/2 + 1
-  received := 1
-  for range ch {
-    count--
-    received++
-    if received >= majority {
-      rf.LOG.Printf("Continue be Leader, received %v/%v append reply", received, len(rf.peers))
-      break
-    }
-    if count == 0 {
-      close(ch)
-      rf.LOG.Printf("Close append channel")
-      break
-    }
-  }
-  if received >= majority {
-    rf.refreshTimeOut()
-    return
-  }
-
-  rf.statMu.Lock() 
-  if rf.role == RaftRoleLeader && rf.curTerm == curTerm {
-    rf.role = RaftRoleFollower
-  }
-  rf.statMu.Unlock()
-
-  rf.LOG.Printf("Leader => Follower, not receive enought append reply")
 }
